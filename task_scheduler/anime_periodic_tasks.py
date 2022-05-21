@@ -1,79 +1,67 @@
 from django.db import IntegrityError
-from anime.models import Anime
-import logging
-import os
-import asyncio
-import httpx
-
-from bs4 import BeautifulSoup
+from .hh.models import Hh
 from .tasks import process_user_stats
+import httpx
+import asyncio
+import requests
+api_hh = 'https://api.hh.ru/vacancies'
 
+params = dict(
+    only_with_salary='true',
+    enable_snippets='true',
+    specialization=1.221,   
+    per_page=100,
+    clusters='true',
+    area=1,
+    st='searchVacancy',
+    )
 
-list_anime = [
-    "Семья шпиона",
-    "Мир отомэ-игр — это тяжёлый мир для мобов",
-    "Госпожа Кагуя: в любви как на войне",
-    "Рыцарь-скелет вступает в параллельный мир",
-    "Восхождение героя щита 2 сезон",
-    "Перестану быть героем",
-    #    "Тусовщик Кунмин",
-    "Величайший Повелитель Демонов перерождается как",
-]
-url_base = "https://naruto-base.su"
-link = f"{url_base}/novosti/drugoe_anime_ru"
-# Количество страниц, которое будет просматривать код
-pages = 3
+clear_hh = {
+    'items': []
+}
 
-
-async def get_html(client, url):
-        response = await client.get(url)
-        return response.text
-
-
-async def get_name_and_id_anime():
-    async with httpx.AsyncClient() as client:
-        tasks = (
-                get_html(
-                    client, f'{link}?page{page}') for page in range(1, pages)
-                )
-        list_content = await asyncio.gather(*tasks)
-        list_url_anime = []
-        for content in list_content:
-            soup = BeautifulSoup(content, "lxml")
-            tags_h2 = soup.find_all('h2')
-            for tag_h2 in tags_h2:
-                tag_title = tag_h2.get_text()
-                tag_href = tag_h2.find('a').get('href')
-                for anime in list_anime:
-                    if anime in tag_title:
-                        link_to_anime = f'{url_base}{tag_href}'
-                        list_url_anime.append(link_to_anime)
-                        list_anime.remove(anime)
-
-        tasks_two = (get_html(client, link) for link in list_url_anime)
-        list_content_anime = await asyncio.gather(*tasks_two)
-        return list_content_anime
-
-list_anime_text = asyncio.run(get_name_and_id_anime())
-
-
-def parse_content_anime():
-    for content_anime in list_anime_text:
-        soup = BeautifulSoup(content_anime, 'lxml')
-        name_anime = soup.find('h1', attrs={'itemprop':'name'}).string
-        id_video = str(soup.find('a', id='ep6')).split("'")[1]
+def create_object(clear_hh):
+    for item in clear_hh['items']:
         try:
-            anime_title_anime = Anime.objects.create(
-                    title_anime=name_anime,
-                    id_anime=id_video,
-                )
-                
-            anime_title_anime.save(force_update=True)
+            new_hh = Hh.objects.create(
+                name=item["name"].lower(),
+                salary=str(
+                    {
+                        "to":       item["salary"]["to"],
+                        "from":     item["salary"]["from"],
+                        "currency": item["salary"]["currency"],
+                    }
+                ),
+                url_id=item["alternate_url"].split("/")[-1],
+                published=item["published_at"],
+                requirement=item["snippet"]["requirement"],
+            )
+            new_hh.save()
         except IntegrityError:
             pass
+        finally:
+            process_user_stats.send()
+async def parse_hh(client,page):
+    response = await client.get(f'{api_hh}?page={page}',params=params)
+    return response.json()
+async def filter_hh(json_hh):
+    for item in json_hh['items']:
+        if item["schedule"]["id"].lower() != 'remote':continue
+        if any(i in item['name'].lower() for i in ('python','django')):
+            if not item['salary']['from']:
+                item['salary']['from'] = 0
+            if not item['salary']['to']:
+                item['salary']['to']   = 0
+            clear_hh['items'].append(item)
 
-
-def last_series_anime():
-    logging.warning("It is time to start the dramatiq task anime")
-    parse_content_anime()
-    process_user_stats.send()
+async def main():
+    total_pages = requests.get(api_hh,params=params).json()['pages']
+    async with httpx.AsyncClient() as client:
+        tasks        = (parse_hh(client,i) for i in range(total_pages))
+        jsons_list   = await asyncio.gather(*tasks)
+        tasks_filter = (filter_hh(json_file) for json_file in jsons_list)
+        await asyncio.gather(*tasks_filter)
+        create_object(clear_hh)
+        #print(jsons_list[0]['items'][0]['salary'])
+        #print(jsons_list)
+asyncio.run(main())
